@@ -88,3 +88,5 @@ nosetests.xml
 coverage.xml
 *.cover
 .hypothesis/ 
+.venv-train/
+datasets/synthetic_face_mobs/
