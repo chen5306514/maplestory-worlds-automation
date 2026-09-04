@@ -111,6 +111,29 @@ if sys.platform == "darwin" and AppKit is not None:
                         color
                     )
 
+                player = snapshot.player
+                if player:
+                    x1, y1, x2, y2 = player.get('bbox', [0, 0, 0, 0])
+                    x1 = x1 / snapshot.capture_scale_x
+                    y1 = y1 / snapshot.capture_scale_y
+                    x2 = x2 / snapshot.capture_scale_x
+                    y2 = y2 / snapshot.capture_scale_y
+                    blue = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        0.15, 0.55, 1.0, 1.0
+                    )
+                    path = AppKit.NSBezierPath.bezierPathWithRect_(
+                        Foundation.NSMakeRect(x1, height - y2, x2 - x1, y2 - y1)
+                    )
+                    path.setLineWidth_(3)
+                    blue.set()
+                    path.stroke()
+                    self._draw_text(
+                        f"我 {player.get('facing', '')} {player.get('score', 0):.2f}",
+                        x1 + 2, max(8, y1 - 8),
+                        AppKit.NSFont.boldSystemFontOfSize_(10),
+                        blue
+                    )
+
                 state = "已暂停" if snapshot.paused else (
                     "攻击" if snapshot.targets else "待机"
                 )
@@ -193,6 +216,7 @@ class VisionSnapshot:
     created_at: float
     detections: List[Detection]
     targets: List[Detection]
+    player: Optional[Dict] = None
     capture_ms: float = 0.0
     inference_ms: float = 0.0
     capture_scale_x: float = 1.0
@@ -407,6 +431,10 @@ class OptimizedMapleBot:
 
     def _load_player_model(self) -> Optional[YOLO]:
         """加载独立的「我」识别模型；没有该模型时继续回退模板匹配"""
+        if bool(self.config.get('player.mock.enabled', False)):
+            logger.info("Mock 角色已启用，跳过加载角色识别模型")
+            return None
+
         model_path = self.config.get('player.model_path', 'weights/player.pt')
         if not model_path or not os.path.exists(model_path):
             logger.info("未找到角色识别模型，角色定位将回退到模板匹配")
@@ -468,6 +496,28 @@ class OptimizedMapleBot:
 
     def detect_player(self, img: np.ndarray) -> Optional[Dict]:
         """用多尺度模板匹配定位角色，同時判斷面向左或右"""
+        mock = self.config.get('player.mock', {})
+        if mock and mock.get('enabled', False):
+            bbox = mock.get('bbox')
+            if isinstance(bbox, list) and len(bbox) == 4:
+                x1, y1, x2, y2 = map(int, bbox)
+                location = (x1, y1)
+                size = (x2 - x1, y2 - y1)
+            else:
+                width = 48
+                height = 64
+                location = (
+                    int(self.monitor['width']) // 2 - width // 2,
+                    max(0, int(self.monitor['height']) - height - 20)
+                )
+                size = (width, height)
+            return self._player_result({
+                'score': float(mock.get('confidence', 1.0)),
+                'facing': str(mock.get('facing', 'right')),
+                'location': location,
+                'size': size
+            })
+
         player = self._detect_player_by_model(img)
         if player is not None:
             return player
@@ -668,6 +718,53 @@ class OptimizedMapleBot:
         self.player_facing = 'left' if direction == 'left' else 'right'
         self.last_turn_time = time.time()
         return True
+
+    def _select_attack_action(
+        self, targets: List[Detection], player: Optional[Dict]
+    ) -> Optional[Tuple[str, str, int]]:
+        """按优先级选择一次攻击动作，返回 (按键, 动作类型, 目标数)"""
+        if not targets:
+            return None
+
+        if player is None:
+            return str(self.config.get('controls.attack_key', 'alt')), 'fallback_attack', len(targets)
+
+        group_distance = int(self.config.get('player.group_attack_distance', 130))
+        group_min_targets = max(2, int(self.config.get('player.group_attack_min_targets', 2)))
+        front_distance = int(self.config.get('player.front_distance', 200))
+        max_dy = int(self.config.get('player.same_platform_max_dy', 45))
+        group_key = str(self.config.get('player.group_attack_key', 'ctrl'))
+        single_key = str(self.config.get('controls.attack_key', 'alt'))
+        facing = str(player.get('facing') or self.player_facing or 'right')
+        player_foot = player.get('foot_center') or player.get('center')
+        if not player_foot:
+            return single_key, 'fallback_attack', len(targets)
+
+        group_targets: List[Detection] = []
+        front_targets: List[Detection] = []
+        for target in targets:
+            foot_x = (target.bbox[0] + target.bbox[2]) // 2
+            foot_y = target.bbox[3]
+            dx = foot_x - player_foot[0]
+            dy = abs(foot_y - player_foot[1])
+            if dy > max_dy:
+                continue
+            if abs(dx) <= group_distance:
+                group_targets.append(target)
+            if facing == 'right' and 0 <= dx <= front_distance:
+                front_targets.append(target)
+            elif facing == 'left' and -front_distance <= dx <= 0:
+                front_targets.append(target)
+
+        # 优先级 1：前后近距离怪物数量达到阈值时使用群击。
+        if len(group_targets) >= group_min_targets:
+            return group_key, 'group_attack', len(group_targets)
+
+        # 优先级 2：只攻击面前目标，身后单怪不触发 ALT。
+        if front_targets:
+            return single_key, 'single_attack', len(front_targets)
+
+        return None
 
     def _attack_cooldown_active(self) -> bool:
         cooldown = float(self.config.get('automation.attack_cooldown', 0.35))
@@ -1245,12 +1342,24 @@ class OptimizedMapleBot:
 
                 detection_started_at = time.perf_counter()
                 detections = self.detect_objects(img)
-                inference_duration = time.perf_counter() - detection_started_at
                 targets = [d for d in detections if d.class_name in TARGET_CLASSES]
+                player = None
+                mock_player = bool(self.config.get('player.mock.enabled', False))
+                if targets or mock_player:
+                    player_started_at = time.perf_counter()
+                    player = self.detect_player(img)
+                    player_duration = time.perf_counter() - player_started_at
+                    inference_duration = (
+                        time.perf_counter() - detection_started_at - player_duration
+                    )
+                    self.last_player_seen = time.time()
+                else:
+                    inference_duration = time.perf_counter() - detection_started_at
                 snapshot = VisionSnapshot(
                     created_at=time.time(),
                     detections=detections,
                     targets=targets,
+                    player=player,
                     capture_ms=capture_duration * 1000.0,
                     inference_ms=inference_duration * 1000.0,
                     capture_scale_x=capture_scale_x,
@@ -1319,23 +1428,31 @@ class OptimizedMapleBot:
                     self.last_mob_detection_time = now
                     if self.mob_present_since is None:
                         self.mob_present_since = now
-                    self._set_control_state('attack')
                     cooldown = float(self.config.get('automation.attack_cooldown', 0.5))
                     if now - self.last_attack_time >= cooldown:
-                        attack_key = str(self.config.get('controls.attack_key', 'alt'))
-                        pyautogui.press(attack_key)
-                        self.last_attack_time = time.time()
-                        self.stats['actions_performed'] += 1
-                        self.stats['mobs_attacked'] += 1
-                        logger.info(
-                            f"攻击目标 {len(targets)} 个 "
-                            f"(最近识别延迟: {(time.time() - snapshot.created_at) * 1000:.0f}ms)"
-                        )
-
-                    reposition_delay = float(self.config.get('automation.stuck_reposition_after', 3.0))
-                    if reposition_delay > 0 and time.time() - self.mob_present_since >= reposition_delay:
-                        self._nudge_position()
-                        self.mob_present_since = time.time()
+                        selected = self._select_attack_action(targets, snapshot.player)
+                        if selected is None:
+                            self._set_control_state('idle')
+                            if now - self.last_player_missing_warning >= 2.0:
+                                facing = snapshot.player.get('facing') if snapshot.player else self.player_facing
+                                logger.info(
+                                    "识别到目标但不在攻击区: "
+                                    f"角色={'未识别' if snapshot.player is None else '已识别'}, "
+                                    f"朝向={facing}, 目标={len(targets)}"
+                                )
+                                self.last_player_missing_warning = now
+                        else:
+                            attack_key, action_type, attack_count = selected
+                            state = 'group_attack' if action_type == 'group_attack' else 'attack'
+                            self._set_control_state(state)
+                            pyautogui.press(attack_key)
+                            self.last_attack_time = time.time()
+                            self.stats['actions_performed'] += 1
+                            self.stats['mobs_attacked'] += 1
+                            logger.info(
+                                f"执行 {action_type}: {attack_key.upper()}，目标 {attack_count} 个 "
+                                f"(最近识别延迟: {(time.time() - snapshot.created_at) * 1000:.0f}ms)"
+                            )
                 else:
                     self._set_control_state('idle')
                     self.mob_present_since = None
@@ -1630,8 +1747,59 @@ class AutoControlPanel:
             row=6, column=3, sticky="w", pady=2
         )
 
+        self.mock_player_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            settings,
+            text="Mock 角色",
+            variable=self.mock_player_enabled_var,
+            command=self._toggle_mock_fields
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
+
+        ttk.Label(settings, text="朝向").grid(row=7, column=2, sticky="e", padx=(8, 4), pady=2)
+        self.mock_facing_var = tk.StringVar(value="right")
+        self.mock_facing_combo = ttk.Combobox(
+            settings,
+            textvariable=self.mock_facing_var,
+            values=("right", "left"),
+            state="readonly",
+            width=8
+        )
+        self.mock_facing_combo.grid(row=7, column=3, sticky="ew", pady=2)
+
+        ttk.Label(settings, text="Mock 置信度").grid(row=8, column=0, sticky="w", pady=2)
+        self.mock_confidence_var = tk.DoubleVar(value=1.0)
+        self.mock_confidence_entry = ttk.Entry(
+            settings, textvariable=self.mock_confidence_var, width=8
+        )
+        self.mock_confidence_entry.grid(
+            row=8, column=1, sticky="ew", pady=2
+        )
+
+        self.mock_bbox_vars = {}
+        self.mock_bbox_spins = {}
+        for index, name in enumerate(("x1", "y1", "x2", "y2")):
+            ttk.Label(settings, text=name).grid(
+                row=9, column=index * 2, sticky="w", padx=(8 if index else 0, 4), pady=2
+            )
+            var = tk.IntVar()
+            self.mock_bbox_vars[name] = var
+            spin = ttk.Spinbox(settings, from_=0, to=5000, textvariable=var, width=7)
+            self.mock_bbox_spins[name] = spin
+            spin.grid(row=9, column=index * 2 + 1, sticky="ew", pady=2)
+
+        self.mock_default_position_var = tk.BooleanVar(value=True)
+        self.mock_default_position_check = ttk.Checkbutton(
+            settings,
+            text="默认位置",
+            variable=self.mock_default_position_var,
+            command=self._toggle_mock_fields
+        )
+        self.mock_default_position_check.grid(
+            row=8, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=2
+        )
+
         ttk.Button(settings, text="保存配置", command=self._save_settings).grid(
-            row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0)
+            row=10, column=0, columnspan=8, sticky="ew", pady=(8, 0)
         )
 
         control = ttk.LabelFrame(root, text="控制", padding=10)
@@ -1699,6 +1867,37 @@ class AutoControlPanel:
         self.debug_enabled_var.set(bool(self.config.get("model.missed_detection_debug.enabled", True)))
         self.overlay_enabled_var.set(bool(self.config.get("overlay.enabled", True)))
 
+        mock = self.config.get("player.mock", {})
+        bbox = mock.get("bbox") if isinstance(mock.get("bbox"), list) else []
+        self.mock_player_enabled_var.set(bool(mock.get("enabled", False)))
+        self.mock_facing_var.set(str(mock.get("facing", "right")))
+        self.mock_confidence_var.set(float(mock.get("confidence", 1.0)))
+        if len(bbox) == 4:
+            self.mock_default_position_var.set(False)
+            for name, value in zip(("x1", "y1", "x2", "y2"), bbox):
+                self.mock_bbox_vars[name].set(int(value))
+        else:
+            self.mock_default_position_var.set(True)
+            width = max(48, int(monitor["width"]) // 8)
+            height = max(64, int(monitor["height"]) // 5)
+            x1 = max(0, int(monitor["width"]) // 2 - width // 2)
+            y1 = max(0, int(monitor["height"]) - height - 20)
+            self.mock_bbox_vars["x1"].set(x1)
+            self.mock_bbox_vars["y1"].set(y1)
+            self.mock_bbox_vars["x2"].set(x1 + width)
+            self.mock_bbox_vars["y2"].set(y1 + height)
+        self._toggle_mock_fields()
+
+    def _toggle_mock_fields(self):
+        enabled = self.mock_player_enabled_var.get()
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.mock_facing_combo.configure(state=state)
+        self.mock_confidence_entry.configure(state=state)
+        self.mock_default_position_check.configure(state=state)
+        bbox_state = tk.DISABLED if self.mock_default_position_var.get() else state
+        for spin in self.mock_bbox_spins.values():
+            spin.configure(state=bbox_state)
+
     def bot_monitor(self) -> Dict:
         return dict(self.config.get("window.default", {"left": 0, "top": 0, "width": 640, "height": 480}))
 
@@ -1738,6 +1937,7 @@ class AutoControlPanel:
                 "enabled": bool(self.overlay_enabled_var.get()),
                 "click_through": True
             }
+            self.config.config["player"]["mock"] = self._mock_settings_from_ui()
 
             if hasattr(self, "_bot"):
                 self._bot.monitor = values.copy()
@@ -1750,11 +1950,40 @@ class AutoControlPanel:
                         return
                 else:
                     self._bot.model.conf = confidence
+                self._bot.player_model = None if mock_enabled else self._bot._load_player_model()
             self._save_config()
             logger.info(f"配置已保存并持久化，监控区: {values}")
             messagebox.showinfo("保存成功", "配置已保存到 config.yaml")
         except (ValueError, TypeError):
             messagebox.showerror("输入错误", "监控区必须是整数；间隔和置信度必须是有效数字")
+
+    def _mock_settings_from_ui(self) -> Dict:
+        mock_enabled = bool(self.mock_player_enabled_var.get())
+        mock_facing = self.mock_facing_var.get()
+        mock_confidence = float(self.mock_confidence_var.get())
+        if mock_confidence <= 0 or mock_confidence > 1:
+            raise ValueError
+        if not self.mock_default_position_var.get():
+            mock_bbox = [int(var.get()) for var in self.mock_bbox_vars.values()]
+            if any(value < 0 for value in mock_bbox) or mock_bbox[2] <= mock_bbox[0] or mock_bbox[3] <= mock_bbox[1]:
+                raise ValueError
+        else:
+            mock_bbox = []
+        return {
+            "enabled": mock_enabled,
+            "facing": mock_facing if mock_facing in ("right", "left") else "right",
+            "confidence": mock_confidence,
+            "bbox": mock_bbox
+        }
+
+    def _apply_mock_settings_to_config(self):
+        """启动前同步 UI 里的 Mock 状态；是否持久化仍由“保存配置”决定"""
+        self.config.config["player"]["mock"] = self._mock_settings_from_ui()
+        if hasattr(self, "_bot"):
+            self._bot.player_model = (
+                None if self._mock_settings_from_ui()["enabled"]
+                else self._bot._load_player_model()
+            )
 
     def _measure_region(self):
         if self.measure_button.instate(["disabled"]):
@@ -1826,6 +2055,11 @@ class AutoControlPanel:
 
     def _start(self, show_preview: bool = False):
         if self._is_running():
+            return
+        try:
+            self._apply_mock_settings_to_config()
+        except (ValueError, TypeError):
+            messagebox.showerror("输入错误", "Mock 置信度和坐标必须是有效数值")
             return
         if self.bot().model is None and not self.bot()._load_model():
             messagebox.showerror("无法启动", "模型未加载")
@@ -2069,6 +2303,19 @@ class AutoControlPanel:
             canvas.create_text(
                 x1 + 2, max(8, y1 - 8), anchor="w", text=label,
                 fill=color, font=("PingFang SC", 10, "bold")
+            )
+        player = snapshot.player
+        if player:
+            x1, y1, x2, y2 = player.get('bbox', [0, 0, 0, 0])
+            x1 = x1 / snapshot.capture_scale_x
+            y1 = y1 / snapshot.capture_scale_y
+            x2 = x2 / snapshot.capture_scale_x
+            y2 = y2 / snapshot.capture_scale_y
+            canvas.create_rectangle(x1, y1, x2, y2, outline="#268cff", width=3)
+            canvas.create_text(
+                x1 + 2, max(8, y1 - 8), anchor="w",
+                text=f"我 {player.get('facing', '')} {player.get('score', 0):.2f}",
+                fill="#268cff", font=("PingFang SC", 10, "bold")
             )
         state = "已暂停" if snapshot.paused else ("攻击" if snapshot.targets else "待机")
         status_text = f"FPS {self.bot().performance_monitor.current_fps} | {state} | 截图 {snapshot.capture_ms:.0f}ms | 推理 {snapshot.inference_ms:.0f}ms"

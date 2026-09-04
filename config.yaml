@@ -44,6 +44,11 @@ player:
   min_confirm_frames: 2
   max_missed_frames: 2
   target_match_distance: 90
+  mock:
+    enabled: false
+    facing: right
+    confidence: 1.0
+    bbox: []
 window:
   default:
     left: 20
