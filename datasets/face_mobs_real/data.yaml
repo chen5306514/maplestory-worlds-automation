@@ -1,0 +1,11 @@
+path: /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/face_mobs_real
+train:
+  - /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/synthetic_face_mobs/images/train
+  - /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/face_mobs_real/images/train
+val:
+  - /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/synthetic_face_mobs/images/val
+  - /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/face_mobs_real/images/val
+
+names:
+  0: 木面怪人
+  1: 石面怪人

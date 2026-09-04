@@ -355,6 +355,7 @@ class OptimizedMapleBot:
         self.vision_thread: Optional[threading.Thread] = None
         self.control_thread: Optional[threading.Thread] = None
         self.overlay_callback = None
+        self.gui_mode = False
         self.stale_snapshot_count = 0
         self.late_vision_cycles = 0
         self.max_runtime = self.config.get('safety.max_runtime_hours', 2) * 3600
@@ -1373,10 +1374,10 @@ class OptimizedMapleBot:
                 # GUI 里的预览必须走 Tk 覆盖层；cv2.imshow 在后台线程
                 # 会和 Tk/Qt 的窗口栈冲突，Windows 上尤其容易报
                 # "Unknown C++ exception from OpenCV code"。
-                if show_preview and self.overlay_callback is None and detections:
+                if show_preview and self.overlay_callback is None and not self.gui_mode and detections:
                     preview_img = self._draw_detections(img.copy(), detections)
                     cv2.imshow('MapleStory Auto Bot - F8 暂停/恢复', preview_img)
-                if show_preview and self.overlay_callback is None:
+                if show_preview and self.overlay_callback is None and not self.gui_mode:
                     cv2.waitKey(1)
 
                 if self.overlay_callback is not None:
@@ -1384,7 +1385,6 @@ class OptimizedMapleBot:
                         self.overlay_callback(snapshot)
                     except Exception as error:
                         logger.error(f"实时覆盖层更新失败: {error}")
-                        self.overlay_callback = None
 
                 if not targets:
                     self._debug_missed_detection(img)
@@ -1798,6 +1798,11 @@ class AutoControlPanel:
             row=8, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=2
         )
 
+        self.mock_measure_button = ttk.Button(
+            settings, text="框选Mock位置", command=self._measure_mock_position
+        )
+        self.mock_measure_button.grid(row=9, column=8, columnspan=2, sticky="ew", pady=(0, 2))
+
         ttk.Button(settings, text="保存配置", command=self._save_settings).grid(
             row=10, column=0, columnspan=8, sticky="ew", pady=(8, 0)
         )
@@ -1954,17 +1959,25 @@ class AutoControlPanel:
             self._save_config()
             logger.info(f"配置已保存并持久化，监控区: {values}")
             messagebox.showinfo("保存成功", "配置已保存到 config.yaml")
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, tk.TclError):
             messagebox.showerror("输入错误", "监控区必须是整数；间隔和置信度必须是有效数字")
 
     def _mock_settings_from_ui(self) -> Dict:
         mock_enabled = bool(self.mock_player_enabled_var.get())
         mock_facing = self.mock_facing_var.get()
-        mock_confidence = float(self.mock_confidence_var.get())
+        try:
+            mock_confidence = float(self.mock_confidence_var.get())
+        except (ValueError, TypeError, tk.TclError):
+            mock_confidence = 0.0
         if mock_confidence <= 0 or mock_confidence > 1:
             raise ValueError
         if not self.mock_default_position_var.get():
-            mock_bbox = [int(var.get()) for var in self.mock_bbox_vars.values()]
+            mock_bbox = []
+            for var in self.mock_bbox_vars.values():
+                try:
+                    mock_bbox.append(int(var.get()))
+                except (ValueError, TypeError, tk.TclError):
+                    mock_bbox.append(0)
             if any(value < 0 for value in mock_bbox) or mock_bbox[2] <= mock_bbox[0] or mock_bbox[3] <= mock_bbox[1]:
                 raise ValueError
         else:
@@ -2034,6 +2047,54 @@ class AutoControlPanel:
         finally:
             self.measure_button.configure(state=tk.NORMAL)
 
+    def _measure_mock_position(self):
+        if self.mock_measure_button.instate(["disabled"]):
+            return
+        self.mock_measure_button.configure(state=tk.DISABLED)
+        try:
+            with mss.mss() as sct:
+                if not sct.monitors:
+                    raise RuntimeError("无法读取显示器信息")
+                monitor_index = self._selected_measure_monitor_index(sct.monitors)
+                monitor = sct.monitors[monitor_index]
+                if monitor["width"] <= 0 or monitor["height"] <= 0:
+                    raise RuntimeError("无法读取屏幕信息。请给终端/Python 授予屏幕录制权限。")
+                frame = np.array(sct.grab(monitor))
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+            scale_x = frame.shape[1] / monitor["width"]
+            scale_y = frame.shape[0] / monitor["height"]
+            self.status_var.set("拖选Mock角色区域，按 Enter 或 Space 确认；Esc 取消")
+            self.root.update_idletasks()
+            x, y, width, height = cv2.selectROI(
+                "框选Mock位置", frame, showCrosshair=True
+            )
+            cv2.destroyAllWindows()
+
+            if width == 0 or height == 0:
+                self.status_var.set("已取消Mock框选")
+                return
+
+            left = int(round(monitor["left"] + x / scale_x))
+            top = int(round(monitor["top"] + y / scale_y))
+            right = left + int(round(width / scale_x))
+            bottom = top + int(round(height / scale_y))
+
+            self.mock_default_position_var.set(False)
+            self._toggle_mock_fields()
+            self.mock_bbox_vars["x1"].set(left)
+            self.mock_bbox_vars["y1"].set(top)
+            self.mock_bbox_vars["x2"].set(right)
+            self.mock_bbox_vars["y2"].set(bottom)
+            self.status_var.set(
+                f"已填入Mock位置: x1={left}, y1={top}, x2={right}, y2={bottom}"
+            )
+        except Exception as error:
+            self.status_var.set(f"Mock框选失败: {error}")
+            logger.error(f"框选Mock位置失败: {error}")
+        finally:
+            self.mock_measure_button.configure(state=tk.NORMAL)
+
     def _save_config(self):
         with open("config.yaml", "w", encoding="utf-8") as f:
             yaml.safe_dump(self.config.config, f, allow_unicode=True, sort_keys=False)
@@ -2058,7 +2119,7 @@ class AutoControlPanel:
             return
         try:
             self._apply_mock_settings_to_config()
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, tk.TclError):
             messagebox.showerror("输入错误", "Mock 置信度和坐标必须是有效数值")
             return
         if self.bot().model is None and not self.bot()._load_model():
@@ -2066,6 +2127,7 @@ class AutoControlPanel:
             return
         self.bot().hotkeys_external = True
         self._start_global_hotkeys()
+        self.bot().gui_mode = True
         self.bot().overlay_callback = self._handle_overlay_snapshot
         if self.overlay_enabled_var.get():
             self._enable_overlay()
