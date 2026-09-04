@@ -46,10 +46,10 @@ player:
   target_match_distance: 90
 window:
   default:
-    left: 670
-    top: 417
-    width: 180
-    height: 90
+    left: 20
+    top: 151
+    width: 788
+    height: 374
   presets:
     small:
       left: 100
@@ -101,7 +101,7 @@ automation:
   action_delay: 0.3
   attack_cooldown: 0.5
   stuck_reposition_after: 3.0
-  scan_interval: 0.5
+  scan_interval: 0.1
   max_detection_distance: 200
   priority_targets:
   - 木面怪人

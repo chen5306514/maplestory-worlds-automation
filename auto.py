@@ -14,6 +14,7 @@ import pyautogui
 import time
 import os
 import sys
+import ctypes
 import logging
 import yaml
 import threading
@@ -34,6 +35,7 @@ except Exception:
 try:
     if sys.platform == "darwin":
         import AppKit
+        import Foundation
     else:
         AppKit = None
 except Exception:
@@ -51,6 +53,115 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TARGET_CLASSES = {"木面怪人", "石面怪人"}
+
+if sys.platform == "darwin" and AppKit is not None:
+    class NativeOverlayView(AppKit.NSView):
+        """macOS 原生透明覆盖层视图；背景保持 alpha=0"""
+        snapshot = None
+
+        def drawRect_(self, rect):
+            try:
+                bounds = self.bounds()
+                width = bounds.size.width
+                height = bounds.size.height
+                AppKit.NSColor.clearColor().set()
+                AppKit.NSBezierPath.fillRect_(bounds)
+
+                yellow = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                    1.0, 0.83, 0.0, 1.0
+                )
+                border = AppKit.NSBezierPath.bezierPathWithRect_(
+                    Foundation.NSMakeRect(1, 1, width - 2, height - 2)
+                )
+                border.setLineWidth_(2)
+                yellow.set()
+                border.stroke()
+
+                snapshot = self.snapshot
+                if snapshot is None:
+                    self._draw_text(
+                        "等待识别...", 12, 16,
+                        AppKit.NSFont.boldSystemFontOfSize_(12),
+                        AppKit.NSColor.whiteColor()
+                    )
+                    return
+
+                for detection in snapshot.detections:
+                    x1, y1, x2, y2 = detection.bbox
+                    x1 = x1 / snapshot.capture_scale_x
+                    y1 = y1 / snapshot.capture_scale_y
+                    x2 = x2 / snapshot.capture_scale_x
+                    y2 = y2 / snapshot.capture_scale_y
+                    is_target = detection.class_name in TARGET_CLASSES
+                    color = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        0.0, 1.0, 0.4, 1.0
+                    ) if is_target else AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        0.53, 0.60, 0.67, 1.0
+                    )
+                    path = AppKit.NSBezierPath.bezierPathWithRect_(
+                        Foundation.NSMakeRect(x1, height - y2, x2 - x1, y2 - y1)
+                    )
+                    path.setLineWidth_(2)
+                    color.set()
+                    path.stroke()
+                    self._draw_text(
+                        f"{detection.class_name} {detection.confidence:.2f}",
+                        x1 + 2, max(8, y1 - 8),
+                        AppKit.NSFont.boldSystemFontOfSize_(10),
+                        color
+                    )
+
+                state = "已暂停" if snapshot.paused else (
+                    "攻击" if snapshot.targets else "待机"
+                )
+                status_text = (
+                    f"FPS {self._current_fps} | {state} | "
+                    f"截图 {snapshot.capture_ms:.0f}ms | "
+                    f"推理 {snapshot.inference_ms:.0f}ms"
+                )
+                background = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+                    0.0, 0.0, 0.0, 0.72
+                )
+                bg_path = AppKit.NSBezierPath.bezierPathWithRect_(
+                    Foundation.NSMakeRect(0, 0, width, 24)
+                )
+                background.set()
+                bg_path.fill()
+                self._draw_bottom_bar_text(
+                    status_text, 10,
+                    AppKit.NSFont.boldSystemFontOfSize_(10),
+                    AppKit.NSColor.whiteColor()
+                )
+            except Exception:
+                pass
+
+        def _draw_text(self, text, top_left_x, top_left_y, font, color):
+            height = self.bounds().size.height
+            attributes = {
+                AppKit.NSFontAttributeName: font,
+                AppKit.NSForegroundColorAttributeName: color
+            }
+            value = Foundation.NSString.stringWithString_(text)
+            size = value.sizeWithAttributes_(attributes)
+            point = Foundation.NSMakePoint(
+                top_left_x,
+                height - top_left_y - size.height
+            )
+            value.drawAtPoint_withAttributes_(point, attributes)
+
+        def _draw_bottom_bar_text(self, text, x, font, color):
+            attributes = {
+                AppKit.NSFontAttributeName: font,
+                AppKit.NSForegroundColorAttributeName: color
+            }
+            value = Foundation.NSString.stringWithString_(text)
+            size = value.sizeWithAttributes_(attributes)
+            y = max(2.0, (24.0 - size.height) / 2.0)
+            value.drawAtPoint_withAttributes_(
+                Foundation.NSMakePoint(x, y), attributes
+            )
+else:
+    NativeOverlayView = None
 
 @dataclass
 class Detection:
@@ -84,6 +195,8 @@ class VisionSnapshot:
     targets: List[Detection]
     capture_ms: float = 0.0
     inference_ms: float = 0.0
+    capture_scale_x: float = 1.0
+    capture_scale_y: float = 1.0
     paused: bool = False
 
 class ConfigManager:
@@ -621,9 +734,11 @@ class OptimizedMapleBot:
 
         height, width = img.shape[:2]
         raw_detections = []
+        y_starts = self._tile_starts(height, tile_size, stride)
+        x_starts = self._tile_starts(width, tile_size, stride)
 
-        for y in range(0, max(1, height - tile_size + 1), stride):
-            for x in range(0, max(1, width - tile_size + 1), stride):
+        for y in y_starts:
+            for x in x_starts:
                 crop = img[y:y + tile_size, x:x + tile_size]
                 results = self.model.predict(
                     crop,
@@ -681,6 +796,20 @@ class OptimizedMapleBot:
             )
             for item in detections
         ]
+
+    def _tile_starts(self, length: int, tile_size: int, stride: int) -> List[int]:
+        """生成分块起点，并强制补齐右侧/底部边界"""
+        length = max(1, int(length))
+        tile_size = max(1, int(tile_size))
+        stride = max(1, int(stride))
+        if length <= tile_size:
+            return [0]
+
+        last_start = length - tile_size
+        starts = list(range(0, last_start + 1, stride))
+        if starts[-1] < last_start:
+            starts.append(last_start)
+        return starts
 
     def _is_excluded_detection(self, center: Tuple[int, int], regions: List) -> bool:
         """排除小地圖、任務列表等固定 UI 區域"""
@@ -1111,6 +1240,8 @@ class OptimizedMapleBot:
                     time.sleep(0.2)
                     continue
                 self.capture_failures = 0
+                capture_scale_x = float(img.shape[1]) / max(1, int(self.monitor["width"]))
+                capture_scale_y = float(img.shape[0]) / max(1, int(self.monitor["height"]))
 
                 detection_started_at = time.perf_counter()
                 detections = self.detect_objects(img)
@@ -1121,17 +1252,22 @@ class OptimizedMapleBot:
                     detections=detections,
                     targets=targets,
                     capture_ms=capture_duration * 1000.0,
-                    inference_ms=inference_duration * 1000.0
+                    inference_ms=inference_duration * 1000.0,
+                    capture_scale_x=capture_scale_x,
+                    capture_scale_y=capture_scale_y
                 )
                 with self.vision_lock:
                     self.vision_snapshot = snapshot
 
                 self.performance_monitor.update_fps()
                 self.cycle_count += 1
-                if show_preview and detections:
+                # GUI 里的预览必须走 Tk 覆盖层；cv2.imshow 在后台线程
+                # 会和 Tk/Qt 的窗口栈冲突，Windows 上尤其容易报
+                # "Unknown C++ exception from OpenCV code"。
+                if show_preview and self.overlay_callback is None and detections:
                     preview_img = self._draw_detections(img.copy(), detections)
                     cv2.imshow('MapleStory Auto Bot - F8 暂停/恢复', preview_img)
-                if show_preview:
+                if show_preview and self.overlay_callback is None:
                     cv2.waitKey(1)
 
                 if self.overlay_callback is not None:
@@ -1154,8 +1290,8 @@ class OptimizedMapleBot:
                     self.late_vision_cycles += 1
                 if remaining > 0:
                     time.sleep(remaining)
-            except Exception as error:
-                logger.error(f"识别线程发生错误: {error}")
+            except Exception:
+                logger.exception("识别线程发生未处理错误")
                 time.sleep(0.2)
 
     def _control_worker(self):
@@ -1373,9 +1509,14 @@ class AutoControlPanel:
         self.worker_thread: Optional[threading.Thread] = None
         self.overlay_window: Optional[tk.Toplevel] = None
         self.overlay_canvas: Optional[tk.Canvas] = None
+        self.overlay_kind: Optional[str] = None
+        self.native_overlay_window = None
+        self.native_overlay_view = None
         self.overlay_latest_snapshot: Optional[VisionSnapshot] = None
         self.closing = False
         self.global_hotkey_monitor = None
+        self.last_hotkey_name = None
+        self.last_hotkey_time = 0.0
         self.measure_monitor_names = self._load_monitor_names()
 
         self.root = tk.Tk()
@@ -1694,6 +1835,8 @@ class AutoControlPanel:
         self.bot().overlay_callback = self._handle_overlay_snapshot
         if self.overlay_enabled_var.get():
             self._enable_overlay()
+        elif show_preview:
+            logger.info("GUI 下预览通过实时画面覆盖显示；请开启“实时画面覆盖”")
         self.worker_thread = threading.Thread(
             target=self._run_worker,
             args=(show_preview,),
@@ -1726,13 +1869,20 @@ class AutoControlPanel:
         self._update_buttons()
 
     def _enable_overlay(self):
-        if self.overlay_window is not None or sys.platform != "darwin" or AppKit is None:
-            if sys.platform != "darwin" or AppKit is None:
+        overlay_supported = (
+            (sys.platform == "darwin" and AppKit is not None) or
+            sys.platform == "win32"
+        )
+        if self.overlay_window is not None or not overlay_supported:
+            if not overlay_supported:
                 logger.warning("当前系统不支持实时覆盖层，改用预览窗口查看检测结果")
             return
         monitor = self.bot_monitor()
         width = max(1, int(monitor["width"]))
         height = max(1, int(monitor["height"]))
+        if sys.platform == "darwin":
+            self._enable_macos_overlay(monitor)
+            return
         self.overlay_window = tk.Toplevel(self.root)
         self.overlay_window.title("实时检测覆盖层")
         self.overlay_window.overrideredirect(True)
@@ -1753,11 +1903,64 @@ class AutoControlPanel:
         self.overlay_canvas.pack(fill=tk.BOTH, expand=True)
         self.overlay_window.update_idletasks()
         self.overlay_latest_snapshot = None
+        self.overlay_kind = "windows"
         self._set_overlay_click_through()
+
+    def _enable_macos_overlay(self, monitor: Dict):
+        if NativeOverlayView is None:
+            logger.warning("macOS 原生覆盖层不可用，请确认 PyObjC 已安装")
+            return
+        AppKit.NSApplication.sharedApplication()
+        left = int(monitor["left"])
+        top = int(monitor["top"])
+        width = max(1, int(monitor["width"]))
+        height = max(1, int(monitor["height"]))
+        primary_frame = AppKit.NSScreen.screens()[0].frame()
+        cocoa_y = (
+            primary_frame.origin.y + primary_frame.size.height
+            - top - height
+        )
+        content_rect = Foundation.NSMakeRect(left, cocoa_y, width, height)
+        window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            content_rect,
+            AppKit.NSWindowStyleMaskBorderless,
+            AppKit.NSBackingStoreBuffered,
+            False
+        )
+        view = NativeOverlayView.alloc().initWithFrame_(content_rect)
+        view.snapshot = None
+        view._current_fps = 0
+        window.setContentView_(view)
+        window.setTitle_("实时检测覆盖层")
+        window.setLevel_(AppKit.NSStatusWindowLevel)
+        window.setOpaque_(False)
+        window.setBackgroundColor_(AppKit.NSColor.clearColor())
+        window.setHasShadow_(False)
+        window.setIgnoresMouseEvents_(True)
+        window.setAcceptsMouseMovedEvents_(False)
+        window.setReleasedWhenClosed_(False)
+        window.setCollectionBehavior_(
+            AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces |
+            AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        window.orderFrontRegardless()
+        self.native_overlay_window = window
+        self.native_overlay_view = view
+        self.overlay_latest_snapshot = None
+        self.overlay_kind = "macos"
+        logger.info("macOS 原生透明覆盖层已启动")
 
     def _disable_overlay(self):
         self.bot().overlay_callback = None
         self.overlay_latest_snapshot = None
+        if self.native_overlay_window is not None:
+            try:
+                self.native_overlay_window.orderOut_(None)
+                self.native_overlay_window.close()
+            except Exception:
+                pass
+        self.native_overlay_window = None
+        self.native_overlay_view = None
         if self.overlay_window is not None:
             try:
                 self.overlay_window.destroy()
@@ -1765,9 +1968,13 @@ class AutoControlPanel:
                 pass
         self.overlay_window = None
         self.overlay_canvas = None
+        self.overlay_kind = None
 
     def _set_overlay_click_through(self):
-        if self.overlay_window is None or AppKit is None:
+        if self.overlay_window is None:
+            return
+        if sys.platform == "win32":
+            self._set_windows_overlay_click_through()
             return
         try:
             app = AppKit.NSApplication.sharedApplication()
@@ -1786,11 +1993,52 @@ class AutoControlPanel:
         except Exception as error:
             logger.warning(f"实时覆盖层鼠标穿透设置失败: {error}")
 
+    def _set_windows_overlay_click_through(self):
+        """Win32 置顶 + 鼠标穿透；Tk 的 winfo_id 需要取父 HWND"""
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.overlay_window.winfo_id())
+            if not hwnd:
+                hwnd = self.overlay_window.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_NOACTIVATE = 0x08000000
+            ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd,
+                GWL_EXSTYLE,
+                ex_style |
+                WS_EX_LAYERED |
+                WS_EX_TRANSPARENT |
+                WS_EX_TOOLWINDOW |
+                WS_EX_NOACTIVATE
+            )
+            HWND_TOPMOST = -1
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            )
+        except Exception as error:
+            logger.warning(f"实时覆盖层鼠标穿透设置失败: {error}")
+
     def _handle_overlay_snapshot(self, snapshot: VisionSnapshot):
         # Tk 控件只能在主线程更新，视觉线程只保存最新快照
         self.overlay_latest_snapshot = snapshot
 
     def _draw_overlay(self):
+        if self.overlay_kind == "macos":
+            self._draw_macos_overlay()
+            return
         if self.overlay_window is None or self.overlay_canvas is None:
             return
         monitor = self.bot_monitor()
@@ -1811,6 +2059,10 @@ class AutoControlPanel:
             return
         for detection in snapshot.detections:
             x1, y1, x2, y2 = detection.bbox
+            x1 = x1 / snapshot.capture_scale_x
+            y1 = y1 / snapshot.capture_scale_y
+            x2 = x2 / snapshot.capture_scale_x
+            y2 = y2 / snapshot.capture_scale_y
             color = "#00ff66" if detection.class_name in TARGET_CLASSES else "#8899aa"
             canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2)
             label = f"{detection.class_name} {detection.confidence:.2f}"
@@ -1828,6 +2080,13 @@ class AutoControlPanel:
             10, height - 13, anchor="w", text=status_text,
             fill="#ffffff", font=("Menlo", 10, "bold")
         )
+
+    def _draw_macos_overlay(self):
+        if self.native_overlay_view is None:
+            return
+        self.native_overlay_view.snapshot = self.overlay_latest_snapshot
+        self.native_overlay_view._current_fps = self.bot().performance_monitor.current_fps
+        self.native_overlay_view.setNeedsDisplay_(True)
 
     def _poll_overlay(self):
         if self.closing:
@@ -1883,7 +2142,36 @@ class AutoControlPanel:
             os.system(f'xdg-open "{directory}"')
 
     def _start_global_hotkeys(self):
-        if AppKit is None or self.global_hotkey_monitor is not None:
+        if self.global_hotkey_monitor is not None:
+            return
+
+        if sys.platform == "win32":
+            if keyboard is None:
+                logger.warning("未安装 pynput，Windows 全局快捷键不可用；仍可使用窗口内 F8/F9")
+                return
+
+            def handle_windows_key(key):
+                try:
+                    if key == keyboard.Key.f8:
+                        self.ui_queue.put(("hotkey", "f8"))
+                    elif key == keyboard.Key.f9:
+                        self.ui_queue.put(("hotkey", "f9"))
+                except Exception as error:
+                    logger.error(f"处理 Windows 快捷键失败: {error}")
+
+            try:
+                self.global_hotkey_monitor = keyboard.Listener(
+                    on_press=handle_windows_key
+                )
+                self.global_hotkey_monitor.daemon = True
+                self.global_hotkey_monitor.start()
+                return
+            except Exception as error:
+                self.global_hotkey_monitor = None
+                logger.warning(f"Windows 全局快捷键启动失败，仍可使用窗口内 F8/F9: {error}")
+                return
+
+        if AppKit is None:
             return
         try:
             mask = AppKit.NSEventMaskKeyDown
@@ -1909,13 +2197,24 @@ class AutoControlPanel:
     def _stop_global_hotkeys(self):
         if self.global_hotkey_monitor is None:
             return
-        try:
-            AppKit.NSEvent.removeMonitor_(self.global_hotkey_monitor)
-        except Exception:
-            pass
+        if sys.platform == "win32":
+            try:
+                self.global_hotkey_monitor.stop()
+            except Exception:
+                pass
+        else:
+            try:
+                AppKit.NSEvent.removeMonitor_(self.global_hotkey_monitor)
+            except Exception:
+                pass
         self.global_hotkey_monitor = None
 
     def _handle_hotkey_name(self, name):
+        now = time.time()
+        if name == self.last_hotkey_name and now - self.last_hotkey_time < 0.25:
+            return
+        self.last_hotkey_name = name
+        self.last_hotkey_time = now
         if name == "f8":
             self._toggle_pause()
         elif name == "f9":
@@ -2032,6 +2331,15 @@ def _select_model(models: Dict[str, str], label: str, default_key: str = '1') ->
 
 def main():
     """主程序"""
+    if sys.platform == "win32":
+        # Tk/MSS/PyAutoGUI 需要同一套物理像素坐标，高缩放屏幕尤其重要
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
     if "--cli" not in sys.argv:
         AutoControlPanel().run()
         return
