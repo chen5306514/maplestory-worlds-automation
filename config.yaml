@@ -111,6 +111,8 @@ automation:
   priority_targets:
   - 木面怪人
   - 石面怪人
+  - 斧木妖
+  - 木妖
   - mob
   mob_hunting:
     enable: false
@@ -151,6 +153,16 @@ detection_behavior:
     max_distance: 200
     attack_delay: 0.15
   石面怪人:
+    action: attack
+    log: true
+    max_distance: 200
+    attack_delay: 0.15
+  斧木妖:
+    action: attack
+    log: true
+    max_distance: 200
+    attack_delay: 0.15
+  木妖:
     action: attack
     log: true
     max_distance: 200

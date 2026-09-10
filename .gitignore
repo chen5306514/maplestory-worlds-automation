@@ -90,3 +90,9 @@ coverage.xml
 .hypothesis/ 
 .venv-train/
 datasets/synthetic_face_mobs/
+runs/
+datasets/mob_axe_stump/
+datasets/mob_stumps/
+datasets/mob_stumps_synth/
+datasets/stump_only/
+*.cache

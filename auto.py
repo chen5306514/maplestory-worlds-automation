@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TARGET_CLASSES = {"木面怪人", "石面怪人"}
+TARGET_CLASSES = {"mob", "木面怪人", "石面怪人", "斧木妖", "木妖"}
 
 if sys.platform == "darwin" and AppKit is not None:
     class NativeOverlayView(AppKit.NSView):
@@ -1066,7 +1066,7 @@ class OptimizedMapleBot:
         try:
             action_performed = False
             
-            if class_name in ('mob', '木面怪人', '石面怪人'):
+            if class_name in TARGET_CLASSES:
                 # 檢查是否啟用攻擊動作
                 mob_action = self.config.get(f'detection_behavior.{class_name}.action', 'attack')
                 if mob_action == 'attack':
