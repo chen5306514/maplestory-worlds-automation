@@ -1,0 +1,29 @@
+path: /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/mob_multi
+train:
+- /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/mob_multi/images/train
+- /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/synthetic_face_mobs/images/train
+- /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/face_mobs_real/images/train
+val:
+- /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/mob_multi/images/val
+- /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/synthetic_face_mobs/images/val
+- /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/face_mobs_real/images/val
+names:
+  0: 木面怪人
+  1: 石面怪人
+  2: 蘑菇仔
+  3: 木妖
+  4: 蜗牛
+  5: 绿水灵
+  6: 绿蘑菇
+  7: 斧木妖
+  8: 花蘑菇
+  9: 漂漂猪
+  10: 蓝水灵
+  11: 蓝蘑菇
+  12: 古木妖
+  13: 猪猪
+  14: 青螃蟹
+  15: 乌龟
+  16: 三眼章鱼
+  17: 刺蘑菇
+  18: 红螃蟹
