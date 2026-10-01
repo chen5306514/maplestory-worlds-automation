@@ -1,0 +1,6 @@
+path: /Users/jianjianchen/data/01-code/02-github/maplestory-worlds-automation/datasets/eyu
+train: images/train
+val: images/val
+
+names:
+  0: 鳄鱼

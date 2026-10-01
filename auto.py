@@ -52,7 +52,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TARGET_CLASSES = {"mob", "木面怪人", "石面怪人", "斧木妖", "木妖"}
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+
+TARGET_CLASSES = {"mob", "木面怪人", "石面怪人", "斧木妖", "木妖", "鳄鱼"}
 
 if sys.platform == "darwin" and AppKit is not None:
     class NativeOverlayView(AppKit.NSView):
@@ -226,15 +229,18 @@ class VisionSnapshot:
 class ConfigManager:
     """配置管理器"""
     
-    def __init__(self, config_path: str = "config.yaml"):
-        self.config_path = config_path
+    def __init__(self, config_path: Optional[str] = None):
+        path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        self.config_path = path.resolve()
         self.config = self.load_config()
     
     def load_config(self) -> Dict:
         """載入配置文件"""
         try:
-            if os.path.exists(self.config_path):
-                with open(self.config_path, 'r', encoding='utf-8') as f:
+            if self.config_path.exists():
+                with self.config_path.open('r', encoding='utf-8') as f:
                     return yaml.safe_load(f)
             else:
                 logger.warning(f"配置文件 {self.config_path} 不存在，使用默认配置")
@@ -1942,7 +1948,8 @@ class AutoControlPanel:
                 "enabled": bool(self.overlay_enabled_var.get()),
                 "click_through": True
             }
-            self.config.config["player"]["mock"] = self._mock_settings_from_ui()
+            mock_settings = self._mock_settings_from_ui()
+            self.config.config["player"]["mock"] = mock_settings
 
             if hasattr(self, "_bot"):
                 self._bot.monitor = values.copy()
@@ -1955,7 +1962,9 @@ class AutoControlPanel:
                         return
                 else:
                     self._bot.model.conf = confidence
-                self._bot.player_model = None if mock_enabled else self._bot._load_player_model()
+                self._bot.player_model = (
+                    None if mock_settings["enabled"] else self._bot._load_player_model()
+                )
             self._save_config()
             logger.info(f"配置已保存并持久化，监控区: {values}")
             messagebox.showinfo("保存成功", "配置已保存到 config.yaml")
@@ -2096,8 +2105,14 @@ class AutoControlPanel:
             self.mock_measure_button.configure(state=tk.NORMAL)
 
     def _save_config(self):
-        with open("config.yaml", "w", encoding="utf-8") as f:
+        config_path = self.config.config_path
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as f:
             yaml.safe_dump(self.config.config, f, allow_unicode=True, sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, config_path)
 
     def _is_running(self):
         return bool(self.worker_thread and self.worker_thread.is_alive())

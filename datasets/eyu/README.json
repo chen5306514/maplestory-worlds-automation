@@ -1,0 +1,8 @@
+{
+  "target": "3110100_鳄鱼.png",
+  "train_images": 480,
+  "val_images": 66,
+  "horizontal_flip": true,
+  "hard_negatives": true,
+  "seed": 20261001
+}
