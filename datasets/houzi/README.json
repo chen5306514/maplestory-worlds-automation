@@ -1,0 +1,11 @@
+{
+  "classes": {
+    "0": "猴子"
+  },
+  "source_variants": 2,
+  "horizontal_flip": true,
+  "hard_negatives": true,
+  "train_images": 600,
+  "val_images": 80,
+  "seed": 20261011
+}

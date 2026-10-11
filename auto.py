@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
-TARGET_CLASSES = {"mob", "木面怪人", "石面怪人", "斧木妖", "木妖", "鳄鱼"}
+TARGET_CLASSES = {"mob", "木面怪人", "石面怪人", "斧木妖", "木妖", "鳄鱼", "猴子"}
 
 if sys.platform == "darwin" and AppKit is not None:
     class NativeOverlayView(AppKit.NSView):
