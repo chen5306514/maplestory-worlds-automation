@@ -364,7 +364,7 @@ class OptimizedMapleBot:
         self.gui_mode = False
         self.stale_snapshot_count = 0
         self.late_vision_cycles = 0
-        self.max_runtime = self.config.get('safety.max_runtime_hours', 2) * 3600
+        self.max_runtime = self._load_max_runtime()
         
         # 統計數據
         self.stats = {
@@ -1257,10 +1257,28 @@ class OptimizedMapleBot:
     
     def _check_safety_conditions(self) -> bool:
         """檢查安全條件"""
-        if self.start_time and time.time() - self.start_time > self.max_runtime:
+        if (
+            self.max_runtime is not None
+            and self.start_time
+            and time.time() - self.start_time > self.max_runtime
+        ):
             logger.warning("达到最大运行时间限制")
             return False
         return True
+
+    def _load_max_runtime(self) -> Optional[float]:
+        """读取最大运行时长；配置为 0 或 null 时表示不限制。"""
+        value = self.config.get('safety.max_runtime_hours', 2)
+        if value is None:
+            return None
+        try:
+            hours = float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"最大运行时间配置无效: {value!r}，回退为 2 小时")
+            hours = 2.0
+        if hours <= 0:
+            return None
+        return hours * 3600
     
     def start_automation(self, show_preview: bool = False):
         """启动视觉线程与控制线程，两者通过最新检测结果快照解耦"""
@@ -1277,6 +1295,10 @@ class OptimizedMapleBot:
         self.late_vision_cycles = 0
         self.last_attack_time = 0.0
         logger.info("开始 MapleStory Worlds 自动化")
+        if self.max_runtime is None:
+            logger.info("最大运行时间: 不限制")
+        else:
+            logger.info(f"最大运行时间: {self.max_runtime / 3600:.2f} 小时")
         if self.hotkey_listener is None and not getattr(self, "hotkeys_external", False):
             self._start_hotkey_listener()
         logger.info("按 F8 暂停/恢复，F9 停止")
@@ -2159,11 +2181,8 @@ class AutoControlPanel:
         self._set_status("运行中")
         self._refresh_buttons()
         self.bot().start_automation(show_preview=show_preview)
-        if not self.closing:
-            self._disable_overlay()
-        if not self.closing:
-            self._set_status("已停止")
-        self._refresh_buttons()
+        # 覆盖层和 Tk 控件只能由主线程操作；通过 UI 队列让 _poll 负责收尾。
+        self.ui_queue.put(("worker_finished", None))
 
     def _toggle_pause(self):
         if not self._is_running():
@@ -2415,7 +2434,14 @@ class AutoControlPanel:
     def _poll_overlay(self):
         if self.closing:
             return
-        self._draw_overlay()
+        try:
+            self._draw_overlay()
+        except tk.TclError:
+            # 覆盖层可能被系统或窗口关闭流程先销毁，清理引用并停止本轮绘制。
+            self.overlay_window = None
+            self.overlay_canvas = None
+            self.overlay_kind = None
+            return
         self.root.after(33, self._poll_overlay)
 
     def _poll_metrics(self):
@@ -2606,7 +2632,17 @@ class AutoControlPanel:
                 self._update_buttons()
             elif kind == "hotkey":
                 self._handle_hotkey_name(value)
+            elif kind == "worker_finished":
+                self._finish_worker_ui()
         self.root.after(300, self._poll)
+
+    def _finish_worker_ui(self):
+        """在 Tk 主线程中清理自动化结束后的界面资源。"""
+        if self.closing:
+            return
+        self._disable_overlay()
+        self._set_status("已停止")
+        self._update_buttons()
 
     def bot(self) -> OptimizedMapleBot:
         if not hasattr(self, "_bot"):
